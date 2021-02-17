@@ -3,9 +3,9 @@ use std::cmp::{min, max};
 use std::convert::TryInto;
 use std::future::{Future};
 use std::marker::PhantomData;
-use std::mem::transmute;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::slice;
 use std::task::{Poll, Context};
 
 use async_std::io::Read as AsyncRead;
@@ -17,7 +17,7 @@ use snafu::{Snafu, ResultExt, Backtrace};
 use edgedb_protocol::server_message::{ServerMessage, ErrorResponse};
 use edgedb_protocol::server_message::{ReadyForCommand, TransactionState};
 use edgedb_protocol::errors::{DecodeError};
-use edgedb_protocol::queryable::Queryable;
+use edgedb_protocol::queryable::{Queryable, Decoder};
 use edgedb_protocol::codec::Codec;
 use edgedb_protocol::value::Value;
 
@@ -39,7 +39,7 @@ pub struct MessageFuture<'a, 'r: 'a> {
 
 // Note: query response expects query *followed by* Sync messsage
 pub struct QueryResponse<'a, D> {
-    pub(crate) seq: Option<client::Sequence<'a>>,
+    pub(crate) seq: client::Sequence<'a>,
     pub(crate) complete: bool,
     pub(crate) error: Option<ErrorResponse>,
     pub(crate) buffer: Vec<Bytes>,
@@ -49,9 +49,9 @@ pub struct QueryResponse<'a, D> {
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum ReadError {
-    #[snafu(display("error decoding message: {}", source))]
+    #[snafu(display("error decoding message"))]
     DecodeErr { source: DecodeError },
-    #[snafu(display("error reading data: {}", source))]
+    #[snafu(display("error reading data"))]
     Io { source: io::Error },
     #[snafu(display("server message out of order: {:?}", message))]
     OutOfOrder { message: ServerMessage, backtrace: Backtrace },
@@ -63,30 +63,39 @@ pub enum ReadError {
 
 pub trait Decode {
     type Output;
-    fn decode(&self, msg: Bytes) -> Result<Self::Output, DecodeError>;
+    fn decode(&self, msg: Bytes)
+        -> Result<Self::Output, DecodeError>;
 }
 
-pub struct QueryableDecoder<T>(PhantomData<*const T>);
+pub struct QueryableDecoder<T> {
+    decoder: Decoder,
+    phantom: PhantomData<*const T>,
+}
 
 unsafe impl<T> Send for QueryableDecoder<T> {}
 impl<D> Unpin for QueryResponse<'_, D> {}
 
 impl<T> QueryableDecoder<T> {
-    pub fn new() -> QueryableDecoder<T> {
-        QueryableDecoder(PhantomData)
+    pub fn new(decoder: Decoder) -> QueryableDecoder<T> {
+        QueryableDecoder {
+            decoder,
+            phantom: PhantomData,
+        }
     }
 }
 
 impl<T: Queryable> Decode for QueryableDecoder<T> {
     type Output = T;
     fn decode(&self, msg: Bytes) -> Result<T, DecodeError> {
-        Queryable::decode(&msg)
+        Queryable::decode(&self.decoder, &msg)
     }
 }
 
 impl Decode for Arc<dyn Codec> {
     type Output = Value;
-    fn decode(&self, msg: Bytes) -> Result<Self::Output, DecodeError> {
+    fn decode(&self, msg: Bytes)
+        -> Result<Self::Output, DecodeError>
+    {
         (&**self).decode(&msg)
     }
 }
@@ -137,7 +146,9 @@ impl<'r> Reader<'r> {
             unsafe {
                 // this is safe because the underlying ByteStream always
                 // initializes read bytes
-                let dest: &mut [u8] = transmute(buf.bytes_mut());
+                let chunk = buf.chunk_mut();
+                let dest: &mut [u8] = slice::from_raw_parts_mut(
+                    chunk.as_mut_ptr(), chunk.len());
                 match Pin::new(&mut *stream).poll_read(cx, dest) {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(ReadError::Eos));
@@ -174,8 +185,7 @@ impl<D> QueryResponse<'_, D>
         Ok(())
     }
     pub async fn get_completion(mut self) -> anyhow::Result<Bytes> {
-        let seq = self.seq.take().expect("poll after end of stream");
-        Ok(seq._process_exec().await?)
+        Ok(self.seq._process_exec().await?)
     }
 }
 
@@ -186,6 +196,7 @@ impl<D> Stream for QueryResponse<'_, D>
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context)
         -> Poll<Option<Self::Item>>
     {
+        assert!(self.seq.active);  // TODO(tailhook) maybe debug_assert
         let QueryResponse {
             ref mut buffer,
             ref mut complete,
@@ -193,7 +204,6 @@ impl<D> Stream for QueryResponse<'_, D>
             ref mut seq,
             ref decoder,
         } = *self;
-        let seq = seq.as_mut().expect("poll after end of stream");
         while buffer.len() == 0 {
             match seq.reader.poll_message(cx) {
                 Poll::Ready(Ok(ServerMessage::Data(data))) if error.is_none()
@@ -216,7 +226,7 @@ impl<D> Stream for QueryResponse<'_, D>
                 Poll::Ready(Ok(ServerMessage::ReadyForCommand(r))) => {
                     if let Some(error) = error.take() {
                         seq.reader.consume_ready(r);
-                        self.seq.take().unwrap().end_clean();
+                        seq.end_clean();
                         return Poll::Ready(Some(
                             RequestError { error }.fail()));
                     } else {
@@ -226,7 +236,7 @@ impl<D> Stream for QueryResponse<'_, D>
                             }.fail()?;
                         }
                         seq.reader.consume_ready(r);
-                        self.seq.take().unwrap().end_clean();
+                        seq.end_clean();
                         return Poll::Ready(None);
                     }
                 }

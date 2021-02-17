@@ -1,12 +1,12 @@
 use std::error::Error;
 use std::{i16, i32, i64};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 
-use edgedb_protocol::codec::{build_codec, build_input_codec};
+use edgedb_protocol::codec::{build_codec};
 use edgedb_protocol::codec::{Codec, ObjectShape};
 use edgedb_protocol::value::{Value};
 use edgedb_protocol::model::{LocalDatetime, LocalDate, LocalTime, Duration};
+use edgedb_protocol::model::{Datetime};
 use edgedb_protocol::descriptors::{Descriptor, TypePos};
 use edgedb_protocol::descriptors::BaseScalarTypeDescriptor;
 use edgedb_protocol::descriptors::{ObjectShapeDescriptor, ShapeElement};
@@ -534,7 +534,7 @@ fn datetime() -> Result<(), Box<dyn Error>> {
 
     encoding_eq!(&codec, b"\0\x02=^\x1bTc\xe7",
         Value::Datetime(
-            UNIX_EPOCH + Duration::new(1577109148, 156903000)));
+            Datetime::UNIX_EPOCH + Duration::new(1577109148, 156903000)));
     Ok(())
 }
 
@@ -655,32 +655,6 @@ fn tuple() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn input_tuple() -> Result<(), Box<dyn Error>> {
-    let codec = build_input_codec(Some(TypePos(1)),
-        &[
-            Descriptor::BaseScalar(
-                BaseScalarTypeDescriptor {
-                    id: "00000000-0000-0000-0000-000000000101".parse()?,
-                },
-            ),
-            Descriptor::Tuple(
-                TupleTypeDescriptor {
-                    id: "6c87a50a-fce2-dcae-6872-8c4c9c4d1e7c".parse()?,
-                    element_types: vec![TypePos(0)],
-                },
-            ),
-        ],
-    )?;
-
-    // TODO(tailhook) test with non-zero reserved bytes
-    encoding_eq!(&codec, bconcat!(b"\0\0\0\x01\0\0\0\x04test"),
-        Value::Tuple(vec![
-            Value::Str("test".into()),
-        ]));
-    Ok(())
-}
-
-#[test]
 fn named_tuple() -> Result<(), Box<dyn Error>> {
     let elements = vec![
         TupleElement {
@@ -717,53 +691,6 @@ fn named_tuple() -> Result<(), Box<dyn Error>> {
     // TODO(tailhook) test with non-zero reserved bytes
     encoding_eq!(&codec, bconcat!(b"\0\0\0\x02\0\0\0\x00\0\0\0"
         b"\x08\0\0\0\0\0\0\0\x01\0\0\0\x00\0\0\0\x01x"),
-        Value::NamedTuple {
-            shape,
-            fields: vec![
-                Value::Int64(1),
-                Value::Str("x".into()),
-            ],
-        });
-    Ok(())
-}
-
-#[test]
-fn input_named_tuple() -> Result<(), Box<dyn Error>> {
-    let elements = vec![
-        TupleElement {
-            name: "a".into(),
-            type_pos: TypePos(0),
-        },
-        TupleElement {
-            name: "b".into(),
-            type_pos: TypePos(1),
-        },
-    ];
-    let shape = elements.as_slice().into();
-    let codec = build_input_codec(Some(TypePos(2)),
-        &[
-            Descriptor::BaseScalar(
-                BaseScalarTypeDescriptor {
-                    id: "00000000-0000-0000-0000-000000000105".parse()?,
-                },
-            ),
-            Descriptor::BaseScalar(
-                BaseScalarTypeDescriptor {
-                    id: "00000000-0000-0000-0000-000000000101".parse()?,
-                },
-            ),
-            Descriptor::NamedTuple(
-                    NamedTupleTypeDescriptor {
-                        id: "101385c1-d6d5-ec67-eec4-b2b88be8a197".parse()?,
-                        elements,
-                    },
-                ),
-        ],
-    )?;
-
-    // TODO(tailhook) test with non-zero reserved bytes
-    encoding_eq!(&codec, bconcat!(b"\0\0\0\x02\0\0\0"
-        b"\x08\0\0\0\0\0\0\0\x01\0\0\0\x01x"),
         Value::NamedTuple {
             shape,
             fields: vec![

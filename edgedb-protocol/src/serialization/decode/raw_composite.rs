@@ -1,4 +1,3 @@
-use crate::queryable::Queryable;
 use crate::errors::{self, DecodeError};
 use snafu::ensure;
 use self::inner::DecodeCompositeInner;
@@ -28,11 +27,6 @@ impl<'t> DecodeTupleLike<'t> {
 
     pub fn read(&mut self) -> Result<Option<&[u8]>, DecodeError> {
         self.inner.read_object_element()
-    }    
-
-    pub fn decode_element<T:Queryable>(&mut self) -> Result<T, DecodeError> {
-        let element = self.read()?;
-        T::decode_optional(element)
     }
 
     pub fn skip_element(&mut self) -> Result<(), DecodeError> {
@@ -41,39 +35,23 @@ impl<'t> DecodeTupleLike<'t> {
     }
 }
 
-pub struct DecodeInputTuple<'t> {
-    inner:DecodeCompositeInner<'t>
-}
-
-impl<'t> DecodeInputTuple<'t> {
-    fn new(buf:&'t [u8]) -> Result<Self, DecodeError> {    
-        let inner = DecodeCompositeInner::read_tuple_like_header(buf)?;
-        Ok(DecodeInputTuple{inner})
-    }
-
-    pub fn with_count(buf:&'t [u8], expected_count:usize) -> Result<Self, DecodeError> {
-        let elements = Self::new(buf)?;
-        ensure!(elements.inner.count() == expected_count, errors::TupleSizeMismatch);
-        Ok(elements)
-    }
-
-    pub fn read(&mut self) -> Result<&[u8], DecodeError> {
-        self.inner.read_array_like_element()
-    }    
-}
-
 pub struct DecodeArrayLike<'t> {
     inner:DecodeCompositeInner<'t>
 }
 
 impl<'t> DecodeArrayLike<'t> {
-    pub fn new_array(buf:&'t [u8]) -> Result<Self, DecodeError> {    
+    pub fn new_array(buf:&'t [u8]) -> Result<Self, DecodeError> {
         let inner = DecodeCompositeInner::read_array_like_header(buf, || errors::InvalidArrayShape.build())?;
         Ok(DecodeArrayLike{inner})
-    }    
+    }
 
-    pub fn new_set(buf:&'t [u8]) -> Result<Self, DecodeError> {    
+    pub fn new_set(buf:&'t [u8]) -> Result<Self, DecodeError> {
         let inner = DecodeCompositeInner::read_array_like_header(buf, || errors::InvalidSetShape.build())?;
+        Ok(DecodeArrayLike{inner})
+    }
+
+    pub fn new_collection(buf:&'t [u8]) -> Result<Self, DecodeError> {
+        let inner = DecodeCompositeInner::read_array_like_header(buf, || errors::InvalidArrayOrSetShape.build())?;
         Ok(DecodeArrayLike{inner})
     }
 }

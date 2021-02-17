@@ -8,7 +8,7 @@ use snafu::{ensure, OptionExt};
 use crate::encoding::{Decode};
 use crate::errors::{self, DecodeError, CodecError};
 use crate::errors::{InvalidTypeDescriptor, UnexpectedTypePos};
-use crate::codec::{Codec, build_codec, build_input_codec};
+use crate::codec::{Codec, build_codec};
 use crate::queryable;
 
 
@@ -132,7 +132,7 @@ impl InputTypedesc {
         &self.array
     }
     pub fn build_codec(&self) -> Result<Arc<dyn Codec>, CodecError> {
-        build_input_codec(Some(self.root_pos()), self.descriptors())
+        build_codec(Some(self.root_pos()), self.descriptors())
     }
     pub fn root_pos(&self) -> TypePos {
         self.root_pos
@@ -177,7 +177,7 @@ impl Decode for Descriptor {
     fn decode(buf: &mut Cursor<Bytes>) -> Result<Self, DecodeError> {
         use Descriptor as D;
         ensure!(buf.remaining() >= 1, errors::Underflow);
-        match buf.bytes()[0] {
+        match buf.chunk()[0] {
             0 => SetDescriptor::decode(buf).map(D::Set),
             1 => ObjectShapeDescriptor::decode(buf).map(D::ObjectShape),
             2 => BaseScalarTypeDescriptor::decode(buf).map(D::BaseScalar),
@@ -186,7 +186,7 @@ impl Decode for Descriptor {
             5 => NamedTupleTypeDescriptor::decode(buf).map(D::NamedTuple),
             6 => ArrayTypeDescriptor::decode(buf).map(D::Array),
             7 => EnumerationTypeDescriptor::decode(buf).map(D::Enumeration),
-            0xF0..=0xFF => {
+            0x7F..=0xFF => {
                 TypeAnnotationDescriptor::decode(buf).map(D::TypeAnnotation)
             }
             descriptor => InvalidTypeDescriptor { descriptor }.fail()?
@@ -333,7 +333,7 @@ impl Decode for TypeAnnotationDescriptor {
     fn decode(buf: &mut Cursor<Bytes>) -> Result<Self, DecodeError> {
         ensure!(buf.remaining() >= 21, errors::Underflow);
         let annotated_type = buf.get_u8();
-        assert!(annotated_type >= 0xF0);
+        assert!(annotated_type >= 0x7F);
         let id = Uuid::decode(buf)?;
         let annotation = String::decode(buf)?;
         Ok(TypeAnnotationDescriptor { annotated_type, id, annotation })

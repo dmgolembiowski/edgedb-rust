@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::str;
+use std::fmt;
 use std::time::{Instant, Duration};
 use std::path::{Path, PathBuf};
 
@@ -18,29 +19,36 @@ use typemap::TypeMap;
 
 use edgedb_protocol::client_message::{ClientMessage, ClientHandshake};
 use edgedb_protocol::server_message::{ServerMessage, Authentication};
-use edgedb_protocol::server_message::{TransactionState};
+use edgedb_protocol::server_message::{TransactionState, ServerHandshake};
 
-use crate::server_params::PostgresAddress;
 use crate::client::{Connection, Sequence};
 use crate::credentials::Credentials;
 use crate::errors::PasswordRequired;
+use crate::features::ProtocolVersion;
 use crate::reader::ReadError;
+use crate::server_params::PostgresAddress;
 
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_WAIT: Duration = Duration::from_secs(30);
+
 
 #[derive(Debug, Clone)]
-enum Addr {
+pub struct Addr(AddrImpl);
+
+#[derive(Debug, Clone)]
+enum AddrImpl {
     Tcp(String, u16),
     Unix(PathBuf),
 }
 
+/// A builder used to create connections
 #[derive(Debug, Clone)]
 pub struct Builder {
     addr: Addr,
-    user: Option<String>,
+    user: String,
     password: Option<String>,
-    database: Option<String>,
-    wait: Option<Duration>,
+    database: String,
+    wait: Duration,
     connect_timeout: Duration,
 }
 
@@ -54,7 +62,7 @@ pub async fn timeout<F, T>(dur: Duration, f: F) -> anyhow::Result<T>
 }
 
 fn sleep_duration() -> Duration {
-    Duration::from_millis(thread_rng().gen_range(10u64, 200u64))
+    Duration::from_millis(thread_rng().gen_range(10u64..200u64))
 }
 
 fn is_temporary_error(e: &anyhow::Error) -> bool {
@@ -87,13 +95,14 @@ fn is_temporary_error(e: &anyhow::Error) -> bool {
 impl Builder {
     pub fn from_credentials(credentials: &Credentials) -> Builder {
         Builder {
-            addr: Addr::Tcp(
+            addr: Addr(AddrImpl::Tcp(
                 credentials.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
-                credentials.port),
-            user: Some(credentials.user.clone()),
+                credentials.port)),
+            user: credentials.user.clone(),
             password: credentials.password.clone(),
-            database: credentials.database.clone(),
-            wait: None,
+            database: credentials.database.clone()
+                .unwrap_or_else(|| "edgedb".into()),
+            wait: DEFAULT_WAIT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
@@ -110,31 +119,57 @@ impl Builder {
                 format!("cannot read credentials file {}", path.display())
         })?)
     }
+    pub fn from_dsn(dsn: &str) -> anyhow::Result<Builder> {
+        if !dsn.starts_with("edgedb://") {
+            anyhow::bail!("String {:?} is not a valid DSN", dsn)
+        };
+        let url = url::Url::parse(dsn)
+            .with_context(|| format!("cannot parse DSN {:?}", dsn))?;
+        Ok(Builder {
+            addr: Addr(AddrImpl::Tcp(
+                url.host_str().unwrap_or("127.0.0.1").to_owned(),
+                url.port().unwrap_or(5656),
+            )),
+            user: if url.username().is_empty() {
+                "edgedb".to_owned()
+            } else {
+                url.username().to_owned()
+            },
+            password: url.password().map(|s| s.to_owned()),
+            database: url.path().strip_prefix("/")
+                .unwrap_or("edgedb").to_owned(),
+            wait: DEFAULT_WAIT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        })
+    }
     pub fn new() -> Builder {
         Builder {
-            addr: Addr::Tcp("127.0.0.1".into(), 5656),
-            user: None,
+            addr: Addr(AddrImpl::Tcp("127.0.0.1".into(), 5656)),
+            user: "edgedb".into(),
             password: None,
-            database: None,
-            wait: None,
+            database: "edgedb".into(),
+            wait: DEFAULT_WAIT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
+    pub fn get_addr(&self) -> &Addr {
+        &self.addr
+    }
     pub fn unix_addr(&mut self, path: impl Into<PathBuf>) -> &mut Self {
-        self.addr = Addr::Unix(path.into());
+        self.addr = Addr(AddrImpl::Unix(path.into()));
         self
     }
     pub fn tcp_addr(&mut self, addr: impl Into<String>, port: u16)
         -> &mut Self
     {
-        self.addr = Addr::Tcp(addr.into(), port);
+        self.addr = Addr(AddrImpl::Tcp(addr.into(), port));
         self
     }
-    pub fn get_user(&self) -> Option<&str> {
-        self.user.as_ref().map(|s| &s[..])
+    pub fn get_user(&self) -> &str {
+        &self.user
     }
     pub fn user(&mut self, user: impl Into<String>) -> &mut Self {
-        self.user = Some(user.into());
+        self.user = user.into();
         self
     }
     pub fn password(&mut self, password: impl Into<String>) -> &mut Self {
@@ -142,16 +177,11 @@ impl Builder {
         self
     }
     pub fn database(&mut self, database: impl Into<String>) -> &mut Self {
-        self.database = Some(database.into());
+        self.database = database.into();
         self
     }
-    pub fn get_database(&self) -> Option<&str> {
-        self.database.as_ref().map(|s| &s[..])
-    }
-    pub fn get_effective_database(&self) -> String {
-        self.database.as_ref().or(self.user.as_ref())
-            .map(|x| x.clone())
-            .unwrap_or_else(|| whoami::username())
+    pub fn get_database(&self) -> &str {
+        &self.database
     }
     /// Time to wait for database server to become available
     ///
@@ -162,7 +192,7 @@ impl Builder {
     /// Note: the whole time that connection is being established can be up to
     /// `wait_until_available + connect_timeout`
     pub fn wait_until_available(&mut self, time: Duration) -> &mut Self {
-        self.wait = Some(time);
+        self.wait = time;
         self
     }
     /// A timeout for a single connect attempt
@@ -184,41 +214,28 @@ impl Builder {
         self
     }
     pub async fn connect(&self) -> anyhow::Result<Connection> {
-        let user = if let Some(user) = &self.user {
-            user.clone()
-        } else {
-            whoami::username()
-        };
-        let database = if let Some(database) = &self.database {
-            database
-        } else {
-            &user
-        };
         match &self.addr {
-            Addr::Tcp(host, port) => {
+            Addr(AddrImpl::Tcp(host, port)) => {
                 log::info!("Connecting via TCP {}:{}", host, port);
             }
-            Addr::Unix(path) => {
+            Addr(AddrImpl::Unix(path)) => {
                 log::info!("Connecting via Unix `{}`", path.display());
             }
         };
 
         let start = Instant::now();
         let conn = loop {
-            match timeout(self.connect_timeout,
-                          self._connect(&user, &database)).await
+            match timeout(self.connect_timeout, self._connect()).await
             {
                 Err(e) if is_temporary_error(&e) => {
                     log::debug!("Temporary connection error: {:#}", e);
-                    if let Some(wait) = self.wait {
-                        if wait > start.elapsed() {
-                            sleep(sleep_duration()).await;
-                            continue;
-                        } else {
-                            Err(e).context(format!("cannot establish \
-                                                    connection for {:?}",
-                                                    wait))?
-                        }
+                    if self.wait > start.elapsed() {
+                        sleep(sleep_duration()).await;
+                        continue;
+                    } else if self.wait > Duration::new(0, 0) {
+                        return Err(e).context(format!("cannot establish \
+                                                       connection for {:?}",
+                                                       self.wait))?;
                     } else {
                         return Err(e)?;
                     }
@@ -232,15 +249,15 @@ impl Builder {
         };
         Ok(conn)
     }
-    async fn _connect(&self, user: &str, database: &str)
+    async fn _connect(&self)
         -> anyhow::Result<Connection>
     {
         let sock = match &self.addr {
-            Addr::Tcp(host, port) => {
+            Addr(AddrImpl::Tcp(host, port)) => {
                 let conn = TcpStream::connect(&(&host[..], *port)).await?;
                 ByteStream::new_tcp_detached(conn)
             }
-            Addr::Unix(path) => {
+            Addr(AddrImpl::Unix(path)) => {
                 #[cfg(windows)] {
                     anyhow::bail!("Unix socket are not supported on windows");
                 }
@@ -251,6 +268,7 @@ impl Builder {
                 }
             }
         };
+        let mut version = ProtocolVersion::current();
         let mut conn = Connection {
             stream: sock,
             input_buf: BytesMut::with_capacity(8192),
@@ -258,25 +276,28 @@ impl Builder {
             params: TypeMap::custom(),
             transaction_state: TransactionState::NotInTransaction,
             dirty: false,
+            version: version.clone(),
         };
         let mut seq = conn.start_sequence().await?;
         let mut params = HashMap::new();
-        params.insert(String::from("user"), user.into());
-        params.insert(String::from("database"), database.into());
+        params.insert(String::from("user"), self.user.clone());
+        params.insert(String::from("database"), self.database.clone());
 
         seq.send_messages(&[
             ClientMessage::ClientHandshake(ClientHandshake {
-                major_ver: 0,
-                minor_ver: 7,
+                major_ver: version.major_ver,
+                minor_ver: version.minor_ver,
                 params,
                 extensions: HashMap::new(),
             }),
         ]).await?;
 
         let mut msg = seq.message().await?;
-        if let ServerMessage::ServerHandshake {..} = msg {
-            log::warn!("Connection negotiantion issue {:?}", msg);
-            // TODO(tailhook) react on this somehow
+        if let ServerMessage::ServerHandshake(ServerHandshake {
+            major_ver, minor_ver, extensions: _
+        }) = msg {
+            version = ProtocolVersion { major_ver, minor_ver };
+            // TODO(tailhook) record extensions
             msg = seq.message().await?;
         }
         match msg {
@@ -285,7 +306,7 @@ impl Builder {
             => {
                 if methods.iter().any(|x| x == "SCRAM-SHA-256") {
                     if let Some(password) = &self.password {
-                        scram(&mut seq, &user, password)
+                        scram(&mut seq, &self.user, password)
                             .await?;
                     } else {
                         Err(PasswordRequired)?;
@@ -338,8 +359,18 @@ impl Builder {
                 }
             }
         }
+        conn.version = version;
         conn.params = server_params;
         Ok(conn)
+    }
+}
+
+impl fmt::Display for Addr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Addr(AddrImpl::Tcp(host, port)) => write!(f, "{}:{}", host, port),
+            Addr(AddrImpl::Unix(path)) => write!(f, "{}", path.display()),
+        }
     }
 }
 
@@ -415,8 +446,46 @@ async fn scram(seq: &mut Sequence<'_>, user: &str, password: &str)
 fn read_credentials() {
     let bld = async_std::task::block_on(
         Builder::read_credentials("tests/credentials1.json")).unwrap();
-    assert!(matches!(bld.addr, Addr::Tcp(_, x) if x == 10702));
-    assert_eq!(bld.user, Some("test3n".into()));
-    assert_eq!(bld.database, Some("test3n".into()));
+    assert!(matches!(bld.addr, Addr(AddrImpl::Tcp(_, x)) if x == 10702));
+    assert_eq!(&bld.user, "test3n");
+    assert_eq!(&bld.database, "test3n");
     assert_eq!(bld.password, Some("lZTBy1RVCfOpBAOwSCwIyBIR".into()));
+}
+
+#[test]
+fn display() {
+    let mut bld = Builder::from_dsn("edgedb://localhost:1756").unwrap();
+    assert_eq!(bld.get_addr().to_string(), "localhost:1756");
+    bld.unix_addr("/test/my.sock");
+    assert_eq!(bld.get_addr().to_string(), "/test/my.sock");
+}
+
+#[test]
+fn from_dsn() {
+    let bld = Builder::from_dsn(
+        "edgedb://user1:EiPhohl7@edb-0134.elb.us-east-2.amazonaws.com/db2").unwrap();
+    assert!(matches!(bld.addr, Addr(AddrImpl::Tcp(h, p)) if
+        h == "edb-0134.elb.us-east-2.amazonaws.com" &&
+        p == 5656));
+    assert_eq!(&bld.user, "user1");
+    assert_eq!(&bld.database, "db2");
+    assert_eq!(bld.password, Some("EiPhohl7".into()));
+
+    let bld = Builder::from_dsn(
+        "edgedb://user2@edb-0134.elb.us-east-2.amazonaws.com:1756/db2").unwrap();
+    assert!(matches!(bld.addr, Addr(AddrImpl::Tcp(h, p)) if
+        h == "edb-0134.elb.us-east-2.amazonaws.com" &&
+        p == 1756));
+    assert_eq!(&bld.user, "user2");
+    assert_eq!(&bld.database, "db2");
+    assert_eq!(bld.password, None);
+
+    let bld = Builder::from_dsn(
+        "edgedb://edb-0134.elb.us-east-2.amazonaws.com:1756").unwrap();
+    assert!(matches!(bld.addr, Addr(AddrImpl::Tcp(h, p)) if
+        h == "edb-0134.elb.us-east-2.amazonaws.com" &&
+        p == 1756));
+    assert_eq!(&bld.user, "edgedb");
+    assert_eq!(&bld.database, "edgedb");
+    assert_eq!(bld.password, None);
 }

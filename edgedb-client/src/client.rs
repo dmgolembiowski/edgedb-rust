@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::default::Default;
 use std::fmt;
 use std::str;
 use std::sync::Arc;
@@ -20,25 +21,23 @@ use edgedb_protocol::client_message::{Execute, ExecuteScript};
 use edgedb_protocol::codec::Codec;
 use edgedb_protocol::server_message::ServerMessage;
 use edgedb_protocol::server_message::{TransactionState};
-use edgedb_protocol::queryable::{Queryable};
+use edgedb_protocol::queryable::{Queryable, Decoder};
 use edgedb_protocol::value::Value;
 use edgedb_protocol::descriptors::OutputTypedesc;
 
-use crate::reader::{self, QueryableDecoder, QueryResponse};
+use crate::server_params::ServerParam;
+use crate::reader::{self, QueryableDecoder, QueryResponse, Reader};
+use crate::errors::NoResultExpected;
 
-pub use crate::reader::Reader;
-
-
-
-pub trait Sealed {}  // TODO(tailhook) private
-pub trait PublicParam: Sealed + typemap::Key + typemap::DebugAny + Send + Sync
-{}
+pub use crate::features::ProtocolVersion;
 
 
+/// A single connection to the EdgeDB
 pub struct Connection {
     pub(crate) stream: ByteStream,
     pub(crate) input_buf: BytesMut,
     pub(crate) output_buf: BytesMut,
+    pub(crate) version: ProtocolVersion,
     pub(crate) params: TypeMap<dyn typemap::DebugAny + Send + Sync>,
     pub(crate) transaction_state: TransactionState,
     pub(crate) dirty: bool,
@@ -47,7 +46,9 @@ pub struct Connection {
 pub struct Sequence<'a> {
     pub writer: Writer<'a>,
     pub reader: Reader<'a>,
+    pub(crate) active: bool,
     dirty: &'a mut bool,
+    proto: &'a ProtocolVersion,
 }
 
 
@@ -56,19 +57,15 @@ pub struct Writer<'a> {
     outbuf: &'a mut BytesMut,
 }
 
-#[derive(Debug)]
-pub struct NoResultExpected {
-    pub completion_message: Bytes,
-}
-
 
 impl<'a> Sequence<'a> {
 
     pub fn response<D: reader::Decode>(self, decoder: D)
         -> QueryResponse<'a, D>
     {
+        assert!(self.active);  // TODO(tailhook) maybe debug_assert
         reader::QueryResponse {
-            seq: Some(self),
+            seq: self,
             buffer: Vec::new(),
             error: None,
             complete: false,
@@ -76,12 +73,22 @@ impl<'a> Sequence<'a> {
         }
     }
 
-    pub fn end_clean(self) {
+    pub fn end_clean(&mut self) {
+        self.active = false;
         *self.dirty = false;
+    }
+
+    fn decoder(&self) -> Decoder {
+        let mut dec = Decoder::default();
+        dec.has_implicit_tid = self.proto.has_implicit_tid();
+        return dec;
     }
 }
 
 impl Connection {
+    pub fn protocol(&self) -> &ProtocolVersion {
+        return &self.version
+    }
     pub async fn passive_wait<T>(&mut self) -> T {
         let mut buf = [0u8; 1];
         self.stream.read(&mut buf[..]).await.ok();
@@ -119,10 +126,16 @@ impl Connection {
             outbuf: &mut self.output_buf,
             stream: &self.stream,
         };
-        Ok(Sequence { writer, reader, dirty: &mut self.dirty})
+        Ok(Sequence {
+            writer,
+            reader,
+            active: true,
+            dirty: &mut self.dirty,
+            proto: &self.version,
+        })
     }
 
-    pub fn get_param<T: PublicParam>(&self)
+    pub fn get_param<T: ServerParam>(&self)
         -> Option<&<T as typemap::Key>::Value>
         where <T as typemap::Key>::Value: fmt::Debug + Send + Sync
     {
@@ -155,27 +168,32 @@ impl<'a> Sequence<'a> {
         -> Result<(), anyhow::Error>
         where I: IntoIterator<Item=&'x ClientMessage>
     {
+        assert!(self.active);  // TODO(tailhook) maybe debug_assert
         self.writer.send_messages(msgs).await
     }
 
-    pub async fn expect_ready(mut self) -> Result<(), reader::ReadError> {
+    pub async fn expect_ready(&mut self) -> Result<(), reader::ReadError> {
+        assert!(self.active);  // TODO(tailhook) maybe debug_assert
         self.reader.wait_ready().await?;
         self.end_clean();
         Ok(())
     }
 
     pub fn message(&mut self) -> reader::MessageFuture<'_, 'a> {
+        assert!(self.active);  // TODO(tailhook) maybe debug_assert
         self.reader.message()
     }
 
     // TODO(tailhook) figure out if this is the best way
-    pub async fn err_sync(mut self) -> Result<(), anyhow::Error> {
+    pub async fn err_sync(&mut self) -> Result<(), anyhow::Error> {
+        assert!(self.active);  // TODO(tailhook) maybe debug_assert
         self.writer.send_messages(&[ClientMessage::Sync]).await?;
         timeout(Duration::from_secs(10), self.expect_ready()).await??;
         Ok(())
     }
 
-    pub async fn _process_exec(mut self) -> anyhow::Result<Bytes> {
+    pub async fn _process_exec(&mut self) -> anyhow::Result<Bytes> {
+        assert!(self.active);  // TODO(tailhook) maybe debug_assert
         let status = loop {
             match self.reader.message().await? {
                 ServerMessage::CommandComplete(c) => {
@@ -201,6 +219,7 @@ impl<'a> Sequence<'a> {
         io_format: IoFormat)
         -> Result<OutputTypedesc, anyhow::Error >
     {
+        assert!(self.active);  // TODO(tailhook) maybe debug_assert
         let statement_name = Bytes::from_static(b"");
 
         self.send_messages(&[
@@ -211,18 +230,17 @@ impl<'a> Sequence<'a> {
                 statement_name: statement_name.clone(),
                 command_text: String::from(request),
             }),
-            ClientMessage::Sync,
+            ClientMessage::Flush,
         ]).await?;
 
         loop {
             let msg = self.reader.message().await?;
             match msg {
                 ServerMessage::PrepareComplete(..) => {
-                    self.reader.wait_ready().await?;
                     break;
                 }
                 ServerMessage::ErrorResponse(err) => {
-                    self.reader.wait_ready().await?;
+                    self.err_sync().await?;
                     return Err(anyhow::anyhow!(err));
                 }
                 _ => {
@@ -248,7 +266,7 @@ impl<'a> Sequence<'a> {
                     break data_desc;
                 }
                 ServerMessage::ErrorResponse(err) => {
-                    self.reader.wait_ready().await?;
+                    self.err_sync().await?;
                     return Err(anyhow::anyhow!(err));
                 }
                 _ => {
@@ -313,9 +331,11 @@ impl Connection {
         let desc = seq._query(request, arguments, IoFormat::Binary).await?;
         match desc.root_pos() {
             Some(root_pos) => {
-                R::check_descriptor(
-                    &desc.as_queryable_context(), root_pos)?;
-                Ok(seq.response(QueryableDecoder::new()))
+                let mut ctx = desc.as_queryable_context();
+                ctx.has_implicit_tid = seq.proto.has_implicit_tid();
+                R::check_descriptor(&ctx, root_pos)?;
+                let decoder = seq.decoder();
+                Ok(seq.response(QueryableDecoder::new(decoder)))
             }
             None => {
                 let completion_message = seq._process_exec().await?;
@@ -362,9 +382,11 @@ impl Connection {
         let desc = seq._query(request, arguments, IoFormat::Json).await?;
         match desc.root_pos() {
             Some(root_pos) => {
-                String::check_descriptor(
-                    &desc.as_queryable_context(), root_pos)?;
-                Ok(seq.response(QueryableDecoder::new()))
+                let mut ctx = desc.as_queryable_context();
+                ctx.has_implicit_tid = seq.proto.has_implicit_tid();
+                String::check_descriptor(&ctx, root_pos)?;
+                let decoder = seq.decoder();
+                Ok(seq.response(QueryableDecoder::new(decoder)))
             }
             None => {
                 let completion_message = seq._process_exec().await?;
@@ -384,9 +406,11 @@ impl Connection {
             IoFormat::JsonElements).await?;
         match desc.root_pos() {
             Some(root_pos) => {
-                String::check_descriptor(
-                    &desc.as_queryable_context(), root_pos)?;
-                Ok(seq.response(QueryableDecoder::new()))
+                let mut ctx = desc.as_queryable_context();
+                ctx.has_implicit_tid = seq.proto.has_implicit_tid();
+                String::check_descriptor(&ctx, root_pos)?;
+                let decoder = seq.decoder();
+                Ok(seq.response(QueryableDecoder::new(decoder)))
             }
             None => {
                 let completion_message = seq._process_exec().await?;
@@ -424,11 +448,3 @@ impl Connection {
 }
 
 
-impl std::error::Error for NoResultExpected {}
-
-impl fmt::Display for NoResultExpected {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "no result expected: {}",
-            String::from_utf8_lossy(&self.completion_message[..]))
-    }
-}
